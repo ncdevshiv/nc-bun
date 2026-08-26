@@ -1069,6 +1069,51 @@ folded: >
           expect(YAML.parse("a:\n  b:\n    c: |2\n      text\n")).toEqual({ a: { b: { c: "text\n" } } });
         });
       });
+
+      describe("error reporting", () => {
+        test("includes line and column in parse error messages", () => {
+          // A plain block scalar with no indentation is a syntax error at
+          // the first content byte of the second line — line 2, column 0.
+          let err: unknown;
+          try {
+            YAML.parse("key:\n|\n");
+          } catch (e) {
+            err = e;
+          }
+          expect(err).toBeInstanceOf(SyntaxError);
+          const msg = (err as SyntaxError).message;
+          expect(msg).toMatch(/\(line \d+, column \d+\)/);
+          // Regression: previously Bun.YAML.parse threw a bare
+          // "Unable to parse YAML string" with no coordinates.
+          expect(msg).toContain("YAML Parse error:");
+        });
+
+        test("reports column-accurate position for unexpected token in flow mapping", () => {
+          let err: unknown;
+          try {
+            // Two colons in a flow mapping: `{a: b: c}` errors at the
+            // second `:` which is column 6 on line 1.
+            YAML.parse("{a: b: c}\n");
+          } catch (e) {
+            err = e;
+          }
+          expect(err).toBeInstanceOf(SyntaxError);
+          const msg = (err as SyntaxError).message;
+          expect(msg).toMatch(/\(line 1, column \d+\)/);
+        });
+
+        test("reports line/column for tab-indentation error", () => {
+          let err: unknown;
+          try {
+            YAML.parse("a:\n\tbad\n");
+          } catch (e) {
+            err = e;
+          }
+          expect(err).toBeInstanceOf(SyntaxError);
+          const msg = (err as SyntaxError).message;
+          expect(msg).toMatch(/\(line \d+, column \d+\)/);
+        });
+      });
     });
 
     test("handles special keys", () => {
@@ -2525,6 +2570,67 @@ production:
           host: "prod.example.com",
           database: "prod_db",
         },
+      });
+    });
+
+    describe("duplicate keys", () => {
+      test("duplicate keys are last-wins by default (matches js-yaml / yaml@2)", () => {
+        expect(YAML.parse("a: 1\na: 2\n")).toEqual({ a: 2 });
+        expect(YAML.parse("{a: 1, a: 2}")).toEqual({ a: 2 });
+      });
+
+      test("uniqueKeys option rejects duplicate block keys with positional error", () => {
+        let err: unknown;
+        try {
+          YAML.parse("a: 1\na: 2\n", { uniqueKeys: true });
+        } catch (e) {
+          err = e;
+        }
+        expect(err).toBeInstanceOf(SyntaxError);
+        const msg = (err as SyntaxError).message;
+        expect(msg).toMatch(/Duplicate key/);
+        expect(msg).toMatch(/\(line \d+, column \d+\)/);
+      });
+
+      test("uniqueKeys option rejects duplicate flow keys", () => {
+        let err: unknown;
+        try {
+          YAML.parse("{a: 1, a: 2}", { uniqueKeys: true });
+        } catch (e) {
+          err = e;
+        }
+        expect(err).toBeInstanceOf(SyntaxError);
+        expect((err as SyntaxError).message).toMatch(/Duplicate key/);
+      });
+
+      test("uniqueKeys option rejects duplicates after a merge key", () => {
+        let err: unknown;
+        try {
+          // `host` is introduced by the merge, then redeclared by the
+          // explicit entry — uniqueKeys should reject at the second occurrence.
+          YAML.parse(
+            `defaults: &d\n  host: x\n  port: 1\ndevelopment:\n  <<: *d\n  host: y\n`,
+            { uniqueKeys: true },
+          );
+        } catch (e) {
+          err = e;
+        }
+        expect(err).toBeInstanceOf(SyntaxError);
+        expect((err as SyntaxError).message).toMatch(/Duplicate key/);
+      });
+
+      test("uniqueKeys does not affect duplicate keys inside arrays", () => {
+        expect(YAML.parse("[1, 1, 1]", { uniqueKeys: true })).toEqual([1, 1, 1]);
+      });
+
+      test("uniqueKeys does not affect duplicate keys at different nesting depths", () => {
+        expect(YAML.parse("a: { a: 1 }\n")).toEqual({ a: { a: 1 } });
+        expect(
+          YAML.parse(
+            `outer:\n  a: 1\n  b:\n    a: 2\n`,
+            { uniqueKeys: true },
+          ),
+        ).toEqual({ outer: { a: 1, b: { a: 2 } } });
       });
     });
 
