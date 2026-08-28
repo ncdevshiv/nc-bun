@@ -361,6 +361,21 @@ pub mod native {
         if target.contains('\0') || app.is_some_and(|a| a.contains('\0')) {
             return Err(OpenError::InvalidTarget("target contains a NUL byte".into()));
         }
+        // An existing directory as `app` causes `ShellExecuteExW` to hand off to
+        // Explorer, whose DDE singleton handshake corrupted the COM state on this
+        // build and produced a sync segfault. Reject any path that resolves to a
+        // directory before the shell call so the promise rejects cleanly.
+        if let Some(a) = app {
+            let app_wide: Vec<u16> = a.encode_utf16().chain(core::iter::once(0)).collect();
+            let attrs = unsafe { bun_sys::c::GetFileAttributesW(app_wide.as_ptr()) };
+            if attrs != 0xFFFF_FFFF
+                && attrs & win32::FILE_ATTRIBUTE_DIRECTORY != 0
+            {
+                return Err(OpenError::InvalidTarget(
+                    format!("options.app is a directory: {a}"),
+                ));
+            }
+        }
 
         let wide = |s: &str| -> Vec<u16> {
             s.encode_utf16().chain(core::iter::once(0)).collect()
@@ -549,7 +564,8 @@ pub(crate) mod watch {
                 // strong slot; the result object needs the same promise.
                 if let Some(mut outer) = w.outer.take() {
                     let exited_value = w.exited.value();
-                    let result = JSValue::create_empty_object(global, 2);
+                    let result = JSValue::create_empty_object(global, 3);
+                    result.put(global, b"ok", JSValue::from(true));
                     result.put(global, b"pid", JSValue::js_number(f64::from(w.pid)));
                     result.put(global, b"exited", exited_value);
                     let _ = w.exited.resolve(global, code_val);

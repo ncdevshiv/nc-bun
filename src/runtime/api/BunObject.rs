@@ -1058,7 +1058,7 @@ fn do_open(global_this: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsRe
     // default `OpenOptions` launches the platform's default opener.
     let mut options = OpenOptions::default();
     let mut wait = false;
-    let mut abort_signal: Option<*mut WebCore::AbortSignal> = None;
+    let mut abort_signal: Option<bun_jsc::AbortSignalRef> = None;
     if let Some(opts_value) = arguments.next_eat() {
         if !opts_value.is_undefined_or_null() {
             if !opts_value.is_object() || opts_value.js_type().is_array() {
@@ -1095,15 +1095,15 @@ fn do_open(global_this: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsRe
             // becomes aborted after the launch does not chase the handler.
             if let Some(signal_value) = opts_value.get(global_this, b"signal")? {
                 if !signal_value.is_undefined_or_null() {
-                    if let Some(signal) = WebCore::AbortSignal::from_js(signal_value) {
-                        // `from_js` returns a live FFI handle owned by JS.
-                        // `AbortSignal` is an `opaque_ffi!` ZST handle; `opaque_ref`
-                        // is the centralised non-null deref proof.
-                        let sig = WebCore::AbortSignal::opaque_ref(signal);
-                        if let Some(abort_error) = sig.node_abort_error_if_aborted(global_this) {
+                    if let Some(signal) = WebCore::AbortSignal::ref_from_js(signal_value) {
+                        // `AbortSignalRef` (`ExternalShared<AbortSignal>`):
+                        // `Clone` → `ref()`, `Drop` → `unref()`, `Deref` → the
+                        // AbortSignal methods. Holding the ref keeps the
+                        // underlying signal alive until the launch settles.
+                        if let Some(abort_error) = signal.node_abort_error_if_aborted(global_this) {
                             return Err(global_this.throw_value(abort_error));
                         }
-                        abort_signal = Some(sig.ref_());
+                        abort_signal = Some(signal);
                     } else {
                         return Err(global_this.throw_invalid_argument_type_value(
                             b"signal",
@@ -1116,14 +1116,9 @@ fn do_open(global_this: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsRe
         }
     }
 
-    // The signal ref must be released on every path from here (scopeguard).
-    let _signal_guard = scopeguard::guard(abort_signal, |abort_signal| {
-        if let Some(signal) = abort_signal {
-            // SAFETY: ref was taken above under the same opaque_ref proof as
-            // the spawn binding's identical pattern.
-            WebCore::AbortSignal::opaque_ref(signal).unref();
-        }
-    });
+    // The stored `AbortSignalRef` must be released on every path from here;
+    // `Drop` performs the balancing `unref()` (scopeguard).
+    let _signal_guard = scopeguard::guard(abort_signal, drop);
 
     // Build the launch. Errors here are caller-input failures (NUL bytes,
     // empty target, unsupported OS) and reject the promise without ever
@@ -1132,6 +1127,54 @@ fn do_open(global_this: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsRe
 
     #[cfg(windows)]
     {
+        // A bare directory target would go through ShellExecuteExW → Explorer
+        // singleton (DDE handshake): `hProcess` comes back null (pid 0), the
+        // test's `pid>0` contract breaks, and the DDE state left on the COM
+        // apartment crashes at process exit. Route directory targets to
+        // `explorer.exe` via `Bun.spawn` instead — real pid, real exited
+        // promise, no COM. URLs, files, and `options.app` still take the
+        // ShellExecute path.
+        if options.app.is_none() {
+            let target_wide: Vec<u16> = target_str
+                .encode_utf16()
+                .chain(core::iter::once(0))
+                .collect();
+            let attrs = unsafe { bun_sys::c::GetFileAttributesW(target_wide.as_ptr()) };
+            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+            if attrs != 0xFFFF_FFFF && attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                let explorer = BunString::from_bytes(b"explorer.exe");
+                let target_s = BunString::from_bytes(target_str.as_bytes());
+                let cmd_array =
+                    bun_string_jsc::to_js_array(global_this, &[explorer, target_s])?;
+                let ignore_string = BunString::from_bytes(b"ignore");
+                let spawn_options = JSValue::create_empty_object(global_this, 4);
+                spawn_options.put(global_this, b"stdin", ignore_string.to_js(global_this)?);
+                spawn_options.put(global_this, b"stdout", ignore_string.to_js(global_this)?);
+                spawn_options.put(global_this, b"stderr", ignore_string.to_js(global_this)?);
+                spawn_options.put(global_this, b"detached", JSValue::from(true));
+                let subprocess = crate::api::js_bun_spawn_bindings::spawn(
+                    global_this,
+                    cmd_array,
+                    Some(spawn_options),
+                )?;
+                let pid = subprocess
+                    .get(global_this, b"pid")?
+                    .unwrap_or(JSValue::ZERO);
+                let exited = subprocess.get(global_this, b"exited")?;
+                let exited = exited.unwrap_or_else(|| {
+                    JSPromise::resolved_promise_value(global_this, JSValue::ZERO)
+                });
+                let result = JSValue::create_empty_object(global_this, 3);
+                result.put(global_this, b"ok", JSValue::from(true));
+                result.put(global_this, b"pid", pid);
+                result.put(global_this, b"exited", exited);
+                let mut outer = JSPromiseStrong::init(global_this);
+                let value = outer.value();
+                let _ = outer.resolve(global_this, result);
+                return Ok(value);
+            }
+        }
+
         let verb: &str = if options.edit { "edit" } else { "open" };
         let app_name: Option<&str> = options
             .app
@@ -1199,7 +1242,8 @@ fn do_open(global_this: &JSGlobalObject, arguments: &mut ArgumentsSlice) -> JsRe
             .get(global_this, b"exited")?
             .unwrap_or_else(|| JSPromise::resolved_promise_value(global_this, JSValue::ZERO));
 
-        let result = JSValue::create_empty_object(global_this, 2);
+        let result = JSValue::create_empty_object(global_this, 3);
+        result.put(global_this, b"ok", JSValue::from(true));
         result.put(global_this, b"pid", pid);
         result.put(global_this, b"exited", exited);
 
@@ -1345,7 +1389,8 @@ fn make_open_result_windows(
         // for. The handler accepted the target, so report success now.
         drop(exited_promise);
         let exited = JSPromise::resolved_promise_value(global_this, JSValue::js_number(0.0));
-        let result = JSValue::create_empty_object(global_this, 2);
+        let result = JSValue::create_empty_object(global_this, 3);
+        result.put(global_this, b"ok", JSValue::from(true));
         result.put(global_this, b"pid", JSValue::ZERO);
         result.put(global_this, b"exited", exited);
 
@@ -1366,7 +1411,8 @@ fn make_open_result_windows(
     // JSPromiseStrong releases its root, so `exited_value` must already be
     // safely held by the (still-live) result object.
     let pid = launch.pid;
-    let result = JSValue::create_empty_object(global_this, 2);
+    let result = JSValue::create_empty_object(global_this, 3);
+    result.put(global_this, b"ok", JSValue::from(true));
     result.put(global_this, b"pid", JSValue::js_number(f64::from(pid)));
     result.put(global_this, b"exited", exited_value);
 
