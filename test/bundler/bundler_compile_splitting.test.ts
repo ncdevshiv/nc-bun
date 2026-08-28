@@ -4,6 +4,75 @@ import { itBundled } from "./expectBundled";
 
 describe("bundler", () => {
   describe("compile with splitting", () => {
+    // The executable's loader registers an entry's whole static-import closure before JSC walks the graph. These
+    // shapes must still load and link in order: a cycle back through the entry, builtins reached from pre-registered
+    // chunks, two dynamic imports issued back to back whose closures overlap, and a dynamic import of a chunk that an
+    // earlier closure already registered but has not finished loading.
+    for (const bytecode of [false, true]) {
+      itBundled(`compile/splitting/PreRegisteredClosure${bytecode ? "+bytecode" : ""}`, {
+        compile: true,
+        splitting: true,
+        bytecode,
+        format: "esm",
+        files: {
+          "/entry.ts": /* js */ `
+            import { a } from "./a";
+            import { isAbsolute } from "node:path";
+            import { run } from "./run";
+            export const fromEntry = "entry";
+            console.log("static", a, isAbsolute("/x"));
+            run();
+          `,
+          "/run.ts": /* js */ `
+            export async function run() {
+              const [x, y, s] = await Promise.all([import("./lazy-x"), import("./lazy-y"), import("./shared")]);
+              console.log("dynamic", x.value, y.value, s.sharedValue);
+            }
+          `,
+          "/a.ts": /* js */ `
+            import { b } from "./b";
+            import os from "os";
+            export const a = "a" + b + typeof os.platform;
+          `,
+          "/b.ts": /* js */ `
+            import { fromEntry } from "./entry";
+            import { readFileSync } from "fs";
+            export const b = "b" + typeof readFileSync;
+            export const later = () => fromEntry;
+          `,
+          "/lazy-x.ts": /* js */ `
+            import { sharedValue } from "./shared";
+            import { createHash } from "crypto";
+            export const value = "x" + sharedValue + typeof createHash;
+          `,
+          "/lazy-y.ts": /* js */ `
+            import { sharedValue } from "./shared";
+            import { inspect } from "node:util";
+            export const value = "y" + sharedValue + typeof inspect;
+          `,
+          "/shared.ts": /* js */ `
+            import { a } from "./a";
+            import zlib from "zlib";
+            export const sharedValue = "s" + a.length + typeof zlib.gzipSync;
+          `,
+        },
+        run: {
+          stdout: "static abfunctionfunction true\ndynamic xs18functionfunction ys18functionfunction s18function",
+          // JSC logs one line per host-hook call. The graph has 7 source modules, 6 distinct builtins and 4 roots
+          // (entry + 3 dynamic imports). With --bytecode each chunk carries its module record, so loading must cost a
+          // host fetch per root (plus the shared chunk reached first by import()) rather than per module, and a host
+          // resolve per root/builtin rather than per import edge.
+          env: { BUN_JSC_dumpModuleLoadingState: "1" },
+          validate({ stderr }) {
+            const count = (kind: string) => stderr.split("\n").filter(l => l.startsWith(`Loader [${kind}] `)).length;
+            expect(count("evaluate")).toBe(7);
+            expect(count("fetch")).toBeLessThanOrEqual(bytecode ? 5 : 13);
+            expect(count("resolve")).toBeLessThanOrEqual(bytecode ? 14 : 23);
+          },
+        },
+      });
+    }
+
     // The embedded module graph is laid out in load order: the entry point's
     // static imports (dependencies first), then each dynamic import's closure,
     // breadth-first. Chunk index order would be entry, lazy1, lazy2, shared,
@@ -356,5 +425,60 @@ describe("bundler", () => {
         stdout: "entry 40\na 41",
       },
     });
+
+    // A require()'d ESM chunk in a compiled binary is embedded under
+    // /$bunfs/root and loaded synchronously from the call, including one made
+    // while the entry is still evaluating (a require cycle), with or without
+    // bytecode. With --bytecode every module that loads — the entry, its
+    // static chunks and both require()'d chunks — must come from its embedded
+    // bytecode; JSC logs one line per module, and the only "Cache miss" is the
+    // `bun:main` wrapper, which never has bytecode.
+    for (const bytecode of [false, true]) {
+      itBundled(`compile/splitting/SplitRequireLoadsChunkSynchronously-${bytecode ? "bytecode" : "source"}`, {
+        compile: true,
+        splitting: true,
+        bytecode,
+        format: "esm",
+        files: {
+          "/entry.ts": /* js */ `
+            import { getTool, eager } from "./registry.ts";
+            console.log("mark:entry", eager.name);
+            console.log(getTool().name);
+            console.log(require("./lazy.ts") === (await import("./lazy.ts")));
+          `,
+          "/registry.ts": /* js */ `
+            export function buildTool(name) { return { name } }
+            export const eager = require("./eager.ts").Tool;
+            export function getTool() { return require("./lazy.ts").Tool }
+          `,
+          "/eager.ts": /* js */ `
+            import { buildTool } from "./registry.ts";
+            console.log("mark:eager");
+            export const Tool = buildTool("eager");
+          `,
+          "/lazy.ts": /* js */ `
+            console.log("mark:lazy");
+            export const Tool = { name: "lazy" };
+          `,
+        },
+        run: {
+          stdout: "mark:eager\nmark:entry eager\nmark:lazy\nlazy\ntrue",
+          env: bytecode ? { BUN_JSC_verboseDiskCache: "1" } : undefined,
+          validate: bytecode
+            ? ({ stderr }) => {
+                const lines = stderr.trim().split("\n");
+                expect(lines.filter(l => l === "[Disk Cache] Cache miss for sourceCode")).toHaveLength(1);
+                const hits = lines.filter(l => l === "[Disk Cache] Cache hit for sourceCode").length;
+                expect(hits).toBeGreaterThanOrEqual(4);
+                expect(lines).toHaveLength(hits + 1);
+              }
+            : undefined,
+        },
+        onAfterBundle(api) {
+          const payload = readFileSync(api.outfile).toString("latin1");
+          expect(payload).toMatch(/import\.meta\.require\("(\/\$bunfs|B:\/~BUN)\/root\/[^"]+\.js"\)/);
+        },
+      });
+    }
   });
 });
